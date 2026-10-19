@@ -46,7 +46,8 @@ int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeB
         return err;
     }
 
-    err = PltCreateConditionVariable(&queueHead->cond, &queueHead->mutex);
+    queueHead->timedWaitSupported = PltCreateConditionVariableTimed(&queueHead->cond, &queueHead->mutex) == 0;
+    err = queueHead->timedWaitSupported ? 0 : PltCreateConditionVariable(&queueHead->cond, &queueHead->mutex);
     if (err != 0) {
         PltDeleteMutex(&queueHead->mutex);
         return err;
@@ -80,6 +81,21 @@ void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead) {
 
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead) {
     return queueHead->currentSize;
+}
+
+void LbqWaitForQueueData(PLINKED_BLOCKING_QUEUE queueHead, int timeoutMs) {
+    if (!queueHead->timedWaitSupported) {
+        PltSleepMs(timeoutMs);
+        return;
+    }
+    uint64_t deadline = PltGetMillis() + timeoutMs;
+    PltLockMutex(&queueHead->mutex);
+    while (queueHead->head == NULL && !queueHead->draining && !queueHead->shutdown && !queueHead->pendingUserWake) {
+        uint64_t now = PltGetMillis();
+        if (now >= deadline) break;
+        PltWaitForConditionVariableTimeout(&queueHead->cond, &queueHead->mutex, (int)(deadline - now));
+    }
+    PltUnlockMutex(&queueHead->mutex);
 }
 
 int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry) {

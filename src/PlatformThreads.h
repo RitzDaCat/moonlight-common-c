@@ -65,6 +65,10 @@ void PltClearEvent(PLT_EVENT* event);
 void PltWaitForEvent(PLT_EVENT* event);
 
 int PltCreateConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex);
+/* Timed conditions use a monotonic clock. Failure leaves cond uninitialized. */
+int PltCreateConditionVariableTimed(PLT_COND* cond, PLT_MUTEX* mutex);
+bool PltWaitForConditionVariableTimeout(PLT_COND* cond, PLT_MUTEX* mutex, int timeoutMs);
+void PltBroadcastConditionVariable(PLT_COND* cond);
 void PltDeleteConditionVariable(PLT_COND* cond);
 void PltSignalConditionVariable(PLT_COND* cond);
 void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex);

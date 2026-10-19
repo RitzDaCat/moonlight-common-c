@@ -91,6 +91,9 @@ static SOCKET ctlSock = INVALID_SOCKET;
 static ENetHost* client;
 static ENetPeer* peer;
 static PLT_MUTEX enetMutex;
+static PLT_COND enetSendProgress;
+static bool enetSendProgressTimed;
+#define CONTROL_SEND_BACKPRESSURE_MS 10
 static bool usePeriodicPing;
 
 static PLT_THREAD lossStatsThread;
@@ -305,6 +308,8 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    enetSendProgressTimed = IS_SUNSHINE() &&
+        PltCreateConditionVariableTimed(&enetSendProgress, &enetMutex) == 0;
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -380,6 +385,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
+    if (enetSendProgressTimed) PltDeleteConditionVariable(&enetSendProgress);
     PltDeleteMutex(&enetMutex);
 }
 
@@ -689,6 +695,18 @@ static bool isPacketSentWaitingForAck(ENetPacket* packet) {
     return false;
 }
 
+/* Called with enetMutex held. Notify only real I/O progress, so competing
+ * backpressured senders cannot wake one another into a polling loop. */
+static int serviceControlSend(void) {
+    enet_uint32 sent = client->totalSentPackets;
+    enet_uint32 received = client->totalReceivedPackets;
+    int err = enet_host_service(client, NULL, 0);
+    if (enetSendProgressTimed && (sent != client->totalSentPackets || received != client->totalReceivedPackets)) {
+        PltBroadcastConditionVariable(&enetSendProgress);
+    }
+    return err;
+}
+
 static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     ENetPacket* enetPacket;
     int err;
@@ -772,24 +790,35 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
 
     // If there is no more data coming soon, send the packet now
     if (!moreData && packetQueued) {
-        err = enet_host_service(client, NULL, 0);
+        err = serviceControlSend();
 
         // Wait until the packet is actually sent to provide backpressure on senders
         if (flags & ENET_PACKET_FLAG_RELIABLE) {
             // Don't wait longer than 10 milliseconds to avoid blocking callers for too long
-            for (int i = 0; err >= 0 && i < 10; i++) {
+            uint64_t deadline = PltGetMillis() + CONTROL_SEND_BACKPRESSURE_MS;
+            while (err >= 0) {
                 // Break on disconnected, acked/freed, or sent (pending ack).
                 if (peer->state != ENET_PEER_STATE_CONNECTED || packetFreed || isPacketSentWaitingForAck(enetPacket)) {
                     break;
                 }
 
-                // Release the lock before sleeping to allow another thread to send/receive
-                PltUnlockMutex(&enetMutex);
-                PltSleepMs(1);
-                PltLockMutex(&enetMutex);
+                uint64_t now = PltGetMillis();
+                if (now >= deadline) break;
+                if (enetSendProgressTimed) {
+                    int waitMs = (int)(deadline - now);
+                    // Wake for the next retransmission deadline even without an ACK.
+                    if (ENET_TIME_GREATER(peer->nextTimeout, client->serviceTime)) {
+                        waitMs = MIN(waitMs, (int)ENET_TIME_DIFFERENCE(peer->nextTimeout, client->serviceTime));
+                    }
+                    PltWaitForConditionVariableTimeout(&enetSendProgress, &enetMutex, waitMs);
+                } else {
+                    PltUnlockMutex(&enetMutex);
+                    PltSleepMs(1);
+                    PltLockMutex(&enetMutex);
+                }
 
                 // Try to send the packet again
-                err = enet_host_service(client, NULL, 0);
+                err = serviceControlSend();
             }
 
             if (err >= 0 && peer->state == ENET_PEER_STATE_CONNECTED && !packetFreed && !isPacketSentWaitingForAck(enetPacket)) {
@@ -1117,6 +1146,7 @@ static void controlReceiveThreadFunc(void* context) {
 
         // Poll for new packets and process retransmissions
         err = serviceEnetHost(client, &event, 0);
+        if (enetSendProgressTimed) PltBroadcastConditionVariable(&enetSendProgress);
 
         // Compute the next time we need to wake up to handle
         // the RTO timer or a ping.

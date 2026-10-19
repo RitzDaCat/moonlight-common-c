@@ -404,6 +404,54 @@ void PltDeleteConditionVariable(PLT_COND* cond) {
 #endif
 }
 
+int PltCreateConditionVariableTimed(PLT_COND* cond, PLT_MUTEX* mutex) {
+#if defined(LC_WINDOWS)
+    return PltCreateConditionVariable(cond, mutex);
+#elif defined(__linux__)
+    pthread_condattr_t attr;
+    (void)mutex;
+    if (pthread_condattr_init(&attr) != 0) return -1;
+    int err = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (err == 0) err = pthread_cond_init(cond, &attr);
+    pthread_condattr_destroy(&attr);
+    if (err != 0) return -1;
+    activeCondVars++;
+    return 0;
+#else
+    (void)cond; (void)mutex;
+    return -1;
+#endif
+}
+
+bool PltWaitForConditionVariableTimeout(PLT_COND* cond, PLT_MUTEX* mutex, int timeoutMs) {
+#if defined(LC_WINDOWS)
+    return SleepConditionVariableSRW(cond, mutex, (DWORD)timeoutMs, 0) != 0;
+#elif defined(__linux__)
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeoutMs / 1000;
+    deadline.tv_nsec += (timeoutMs % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(cond, mutex, &deadline) == 0;
+#else
+    (void)cond; (void)mutex; (void)timeoutMs;
+    return false;
+#endif
+}
+
+void PltBroadcastConditionVariable(PLT_COND* cond) {
+#if defined(LC_WINDOWS)
+    WakeAllConditionVariable(cond);
+#elif defined(__linux__)
+    pthread_cond_broadcast(cond);
+#else
+    PltSignalConditionVariable(cond);
+#endif
+}
+
 void PltSignalConditionVariable(PLT_COND* cond) {
 #if defined(LC_WINDOWS)
     WakeConditionVariable(cond);

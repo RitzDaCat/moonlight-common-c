@@ -319,6 +319,17 @@ static void floatToNetfloat(float in, netfloat out) {
     }
 }
 
+static void waitForInputBatch(int timeoutMs) {
+    flushInputOnControlStream();
+    if (IS_SUNSHINE()) {
+        /* A button/controller arrival ends the motion batch immediately. The
+         * current motion is still sent first, preserving FIFO and edge order. */
+        LbqWaitForQueueData(&packetQueue, timeoutMs);
+    } else {
+        PltSleepMs(timeoutMs);
+    }
+}
+
 // Input thread proc
 static void inputSendThreadProc(void* context) {
     SOCK_RET err;
@@ -368,8 +379,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
+                waitForInputBatch((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
 
@@ -439,8 +449,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
+                waitForInputBatch((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
 
@@ -471,8 +480,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
+                waitForInputBatch((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
 
@@ -553,13 +561,14 @@ static void inputSendThreadProc(void* context) {
             // and UTF-8 text events with each other. We need to make sure any previous keyboard events
             // have been processed prior to sending these UTF-8 events to avoid interference between
             // the two (especially with modifier keys).
-            flushInputOnControlStream();
-            while (!PltIsThreadInterrupted(&inputSendThread) && isControlDataInTransit()) {
-                PltSleepMs(10);
+            if (!IS_SUNSHINE()) {
+                flushInputOnControlStream();
+                while (!PltIsThreadInterrupted(&inputSendThread) && isControlDataInTransit()) {
+                    PltSleepMs(10);
+                }
+                // GFE's keyboard/text synchronization workaround.
+                PltSleepMs(50);
             }
-
-            // Finally, sleep an additional 50 ms to allow the events to be processed by Windows
-            PltSleepMs(50);
 
             // We send each Unicode code point individually. This way we can always ensure they will
             // never straddle a packet boundary (which will cause a parsing error on the host).
@@ -593,7 +602,7 @@ static void inputSendThreadProc(void* context) {
                 memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], codePointLength);
 
                 // Encrypt and send the split packet
-                if (!sendInputPacket(&splitPacket, i + 1 < totalLength)) {
+                if (!sendInputPacket(&splitPacket, i + codePointLength < totalLength)) {
                     freePacketHolder(holder);
                     return;
                 }
@@ -977,7 +986,9 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
         return -1;
     }
 
-    holder->channelId = CTRL_CHANNEL_UTF8;
+    /* Sunshine accepts both payloads on the same reliable ordered channel.
+     * This preserves modifier-release/text order without GFE's drain/sleep. */
+    holder->channelId = IS_SUNSHINE() ? CTRL_CHANNEL_KEYBOARD : CTRL_CHANNEL_UTF8;
     holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     // Magic + string length

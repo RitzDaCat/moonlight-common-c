@@ -26,6 +26,7 @@ typedef struct _LINKED_BLOCKING_QUEUE {
     bool shutdown;
     bool draining;
     bool pendingUserWake;
+    bool timedWaitSupported;
 } LINKED_BLOCKING_QUEUE, *PLINKED_BLOCKING_QUEUE;
 
 int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeBound);
@@ -39,3 +40,5 @@ void LbqSignalQueueShutdown(PLINKED_BLOCKING_QUEUE queueHead);
 void LbqSignalQueueDrain(PLINKED_BLOCKING_QUEUE queueHead);
 void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead);
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead);
+/* Wait for data/rundown without consuming or reordering any entry. */
+void LbqWaitForQueueData(PLINKED_BLOCKING_QUEUE queueHead, int timeoutMs);
